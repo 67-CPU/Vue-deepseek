@@ -1,5 +1,6 @@
 <script setup>
 import { ref, nextTick, onMounted } from "vue";
+import { marked } from "marked";
 
 // --- State ---
 const messages = ref([]);
@@ -15,6 +16,8 @@ const models = [
 
 const systemPrompt = ref("");
 const chatEl = ref(null);
+const weatherStatus = ref(null); // { status, city }
+let abortController = null; // 用于中断 fetch 请求
 
 // --- Check API status on mount ---
 onMounted(async () => {
@@ -34,13 +37,23 @@ async function sendMessage() {
 
   messages.value.push({ role: "user", content: text });
   input.value = "";
+  weatherStatus.value = null;
 
   const assistantMsg = { role: "assistant", content: "" };
   messages.value.push(assistantMsg);
   isLoading.value = true;
 
+  // 创建新的 AbortController，用于中断本次请求
+  abortController = new AbortController();
+
   await nextTick();
   scrollToBottom();
+
+  // 天气类问题且用户未显式带城市时，尝试前端定位城市并随请求带上
+  let userCity = undefined;
+  if (isWeatherQuery(text)) {
+    userCity = await getUserCity();
+  }
 
   try {
     const response = await fetch("/api/chat", {
@@ -53,7 +66,9 @@ async function sendMessage() {
         model: model.value,
         max_tokens: 4096,
         system: systemPrompt.value || undefined,
+        userCity,
       }),
+      signal: abortController.signal, // 关联中断信号
     });
 
     const reader = response.body.getReader();
@@ -76,6 +91,8 @@ async function sendMessage() {
               assistantMsg.content += data.text;
             } else if (data.type === "error") {
               assistantMsg.content = `Error: ${data.message}`;
+            } else if (data.type === "weather_status") {
+              weatherStatus.value = { status: data.status, city: data.city };
             }
           } catch {
             // skip parse errors
@@ -84,9 +101,13 @@ async function sendMessage() {
       }
     }
   } catch (err) {
-    assistantMsg.content = `Connection error: ${err.message}`;
+    // AbortError 是用户主动停止，不需要显示错误
+    if (err.name !== "AbortError") {
+      assistantMsg.content = `Connection error: ${err.message}`;
+    }
   } finally {
     isLoading.value = false;
+    abortController = null;
     await nextTick();
     scrollToBottom();
   }
@@ -95,6 +116,41 @@ async function sendMessage() {
 function scrollToBottom() {
   if (chatEl.value) {
     chatEl.value.scrollTop = chatEl.value.scrollHeight;
+  }
+}
+
+// 天气相关触发关键词（与后端保持一致）
+const WEATHER_KEYWORDS = [
+  "天气", "气温", "温度", "多少度", "几度", "下雨", "降雨", "下雪",
+  "阴", "晴", "多云", "台风", "暴雨", "大风", "雾霾", "湿度", "体感",
+  "气象", "冷不冷", "热不热", "穿什么", "紫外线", "雷阵雨", "冰雹",
+];
+
+// 判断文本是否像天气类问题
+function isWeatherQuery(text) {
+  return WEATHER_KEYWORDS.some((kw) => text.includes(kw));
+}
+
+// 前端浏览器定位：拿到经纬度后用 Open-Meteo 反向地理编码得到中文城市名
+async function getUserCity() {
+  if (!("geolocation" in navigator)) return null;
+  try {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        timeout: 5000,
+        maximumAge: 600000,
+      })
+    );
+    const { latitude, longitude } = pos.coords;
+    const res = await fetch(
+      `https://geocoding-api.open-meteo.com/v1/search?latitude=${latitude}&longitude=${longitude}&count=1&language=zh`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const city = data?.results?.[0]?.name;
+    return city || null;
+  } catch {
+    return null;
   }
 }
 
@@ -107,6 +163,18 @@ function handleKeydown(e) {
     e.preventDefault();
     sendMessage();
   }
+}
+
+function stopGenerating(){
+  // 中断 fetch 请求，这会触发 AbortError，同时后端也能感知到连接断开
+  if (abortController) {
+    abortController.abort();
+  }
+  isLoading.value = false;
+}
+
+function renderMarkdown(content) {
+  return content ? marked.parse(content) : "";
 }
 </script>
 
@@ -122,24 +190,37 @@ function handleKeydown(e) {
           </option>
         </select>
         <button class="btn-clear" :disabled="messages.length === 0" @click="clearChat">
-          Clear
+          清空消息
         </button>
       </div>
     </header>
 
     <!-- API warning -->
     <div v-if="apiConfigured === false" class="banner banner-warn">
-      ⚠ API key not configured — edit <code>.env</code> and set
+      ⚠ 请检查您的API Key 是否配置<code>.env</code> and set
       <code>DEEPSEEK_API_KEY</code>, then restart.
+    </div>
+
+    <!-- 天气查询状态提示 -->
+    <div v-if="weatherStatus" class="banner banner-info">
+      <span v-if="weatherStatus.status === 'fetching'">
+        🌤 正在查询{{ weatherStatus.city }}天气...
+      </span>
+      <span v-else-if="weatherStatus.status === 'done'">
+        ✅ 已获取{{ weatherStatus.city }}实时天气，正在生成回答...
+      </span>
+      <span v-else-if="weatherStatus.status === 'failed'">
+        ⚠ {{ weatherStatus.city }}天气查询失败，将直接回答
+      </span>
     </div>
 
     <!-- System prompt -->
     <details class="system-prompt-section">
-      <summary>System Prompt (optional)</summary>
+      <summary>系统提示词（可选）</summary>
       <textarea
         v-model="systemPrompt"
         class="system-input"
-        placeholder="Set a system prompt to control DeepSeek's behavior..."
+        placeholder="快来设置系统提示词来控制DeepSeek的回答"
         rows="3"
       />
     </details>
@@ -148,7 +229,7 @@ function handleKeydown(e) {
     <main ref="chatEl" class="chat">
       <div v-if="messages.length === 0" class="empty-state">
         <div class="empty-icon">💬</div>
-        <p>Send a message to start chatting with DeepSeek</p>
+        <p>快和DeepSeek开启对话~</p>
       </div>
 
       <div
@@ -157,11 +238,12 @@ function handleKeydown(e) {
         :class="['message', msg.role === 'user' ? 'message-user' : 'message-assistant']"
       >
         <div class="message-role">{{ msg.role === "user" ? "You" : "DeepSeek" }}</div>
-        <div class="message-content">{{ msg.content || "..." }}</div>
+        <!-- <div class="message-content">{{ msg.content || "..." }}</div> -->
+         <div class="message-content" v-html="renderMarkdown(msg.content)"></div>
       </div>
 
       <div v-if="isLoading && messages[messages.length - 1]?.content === ''" class="loading">
-        DeepSeek is thinking<span class="dots" />
+        DeepSeek思考中<span class="dots" />
       </div>
     </main>
 
@@ -170,14 +252,15 @@ function handleKeydown(e) {
       <textarea
         v-model="input"
         class="chat-input"
-        placeholder="Type your message... (Enter to send, Shift+Enter for newline)"
+        placeholder="输入你的消息... (Enter发送, Shift+Enter换行)"
         rows="2"
         :disabled="isLoading"
         @keydown="handleKeydown"
       />
       <button class="btn-send" :disabled="!input.trim() || isLoading" @click="sendMessage">
-        {{ isLoading ? "Sending…" : "Send" }}
+        {{ isLoading ? "发送中..." : "发送" }}
       </button>
+      <button class="btn-stop" @click="stopGenerating" :disabled="!isLoading">停止生成</button>
     </footer>
   </div>
 </template>
@@ -239,6 +322,11 @@ function handleKeydown(e) {
   background: #fff3cd;
   color: #856404;
   border-bottom: 1px solid #ffc107;
+}
+.banner-info {
+  background: #e3f2fd;
+  color: #1565c0;
+  border-bottom: 1px solid #90caf9;
 }
 .banner code {
   background: rgba(0, 0, 0, 0.08);
@@ -386,6 +474,24 @@ function handleKeydown(e) {
   background: #0062cc;
 }
 .btn-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-stop{
+  padding: 0 24px;
+  background: #cfdceb;
+  color: #000000;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-stop:hover:not(:disabled) {
+  background: #0062cc;
+}
+.btn-stop:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
