@@ -1,5 +1,7 @@
 # DeepSeek Chat
 
+> 仓库名：`67-CPU-vue-deepseek-chat`
+
 一个基于 **Vue 3 + Vite + Express** 构建的 DeepSeek 流式对话应用。支持实时天气查询、Markdown 渲染、多模型切换、可中断生成等功能，开箱即用，方便持续扩展新功能。
 
 > 本项目仍在持续开发中，欢迎通过 Issue / PR 提出新功能建议。
